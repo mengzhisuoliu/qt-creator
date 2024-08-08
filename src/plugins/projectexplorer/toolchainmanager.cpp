@@ -11,10 +11,11 @@
 
 #include <coreplugin/icore.h>
 
+#include <utils/algorithm.h>
+#include <utils/environment.h>
 #include <utils/fileutils.h>
 #include <utils/persistentsettings.h>
 #include <utils/qtcassert.h>
-#include <utils/algorithm.h>
 
 #include <nanotrace/nanotrace.h>
 
@@ -27,12 +28,6 @@ namespace Internal {
 // ToolchainManagerPrivate
 // --------------------------------------------------------------------------
 
-struct LanguageDisplayPair
-{
-    Utils::Id id;
-    QString displayName;
-};
-
 class ToolchainManagerPrivate
 {
 public:
@@ -42,8 +37,13 @@ public:
 
     Toolchains m_toolChains; // prioritized List
     BadToolchains m_badToolchains;   // to be skipped when auto-detecting
-    QVector<LanguageDisplayPair> m_languages;
-    QList<std::pair<LanguageCategory, QString>> m_languageCategories;
+
+    QList<Id> m_languages;
+    QHash<Id, QString> m_displayNameForLanguage;
+
+    QList<LanguageCategory> m_languageCategories;
+    QHash<LanguageCategory, QString> m_displayNameForCategory;
+
     ToolchainDetectionSettings m_detectionSettings;
     bool m_loaded = false;
 };
@@ -244,7 +244,7 @@ void ToolchainManager::deregisterToolchains(const Toolchains &toolchains)
 
 QList<Id> ToolchainManager::allLanguages()
 {
-    return Utils::transform<QList>(d->m_languages, &LanguageDisplayPair::id);
+    return d->m_languages;
 }
 
 bool ToolchainManager::registerLanguage(const Utils::Id &language, const QString &displayName)
@@ -252,40 +252,37 @@ bool ToolchainManager::registerLanguage(const Utils::Id &language, const QString
     QTC_ASSERT(language.isValid(), return false);
     QTC_ASSERT(!isLanguageSupported(language), return false);
     QTC_ASSERT(!displayName.isEmpty(), return false);
-    d->m_languages.push_back({language, displayName});
+    d->m_languages.push_back(language);
+    d->m_displayNameForLanguage.insert(language, displayName);
     return true;
 }
 
 void ToolchainManager::registerLanguageCategory(const LanguageCategory &languages, const QString &displayName)
 {
-    d->m_languageCategories.push_back(std::make_pair(languages, displayName));
+    d->m_languageCategories.push_back(languages);
+    d->m_displayNameForCategory.insert(languages, displayName);
 }
 
 QString ToolchainManager::displayNameOfLanguageId(const Utils::Id &id)
 {
     QTC_ASSERT(id.isValid(), return Tr::tr("None"));
-    auto entry = Utils::findOrDefault(d->m_languages, Utils::equal(&LanguageDisplayPair::id, id));
-    QTC_ASSERT(entry.id.isValid(), return Tr::tr("None"));
-    return entry.displayName;
+    QString display = d->m_displayNameForLanguage.value(id);
+    QTC_ASSERT(!display.isEmpty(), return Tr::tr("None"));
+    return display;
 }
 
 QString ToolchainManager::displayNameOfLanguageCategory(const LanguageCategory &category)
 {
     if (int(category.size()) == 1)
         return displayNameOfLanguageId(*category.begin());
-    QString name = Utils::findOrDefault(d->m_languageCategories, [&category](const auto &e) {
-                       return e.first == category;
-                   }).second;
+    QString name = d->m_displayNameForCategory.value(category);
     QTC_ASSERT(!name.isEmpty(), return Tr::tr("None"));
     return name;
 }
 
 const QList<LanguageCategory> ToolchainManager::languageCategories()
 {
-    QList<LanguageCategory> categories
-        = Utils::transform<QList<LanguageCategory>>(d->m_languageCategories, [](const auto &e) {
-              return e.first;
-          });
+    QList<LanguageCategory> categories = d->m_languageCategories;
     const QList<Utils::Id> languages = allLanguages();
     for (const Utils::Id &l : languages) {
         if (Utils::contains(categories, [l](const LanguageCategory &lc) {
@@ -301,7 +298,7 @@ const QList<LanguageCategory> ToolchainManager::languageCategories()
 
 bool ToolchainManager::isLanguageSupported(const Utils::Id &id)
 {
-    return Utils::contains(d->m_languages, Utils::equal(&LanguageDisplayPair::id, id));
+    return d->m_languages.contains(id);
 }
 
 void ToolchainManager::aboutToShutdown()
@@ -333,6 +330,60 @@ bool ToolchainManager::isBadToolchain(const Utils::FilePath &toolchain)
 void ToolchainManager::addBadToolchain(const Utils::FilePath &toolchain)
 {
     d->m_badToolchains.toolchains << toolchain;
+}
+
+// Use as a tie-breaker for toolchains that match the strong requirements like toolchain type
+// and ABI.
+// For toolchains with the same priority, gives precedence to icecc and ccache
+// and otherwise simply chooses the one with the shortest path.
+bool ToolchainManager::isBetterToolchain(
+    const ToolchainBundle &bundle1, const ToolchainBundle &bundle2)
+{
+    const int priority1 = bundle1.get(&Toolchain::priority);
+    const int priority2 = bundle2.get(&Toolchain::priority);
+    if (priority1 > priority2)
+        return true;
+    if (priority1 < priority2)
+        return false;
+
+    const QString path1 = bundle1.get(&Toolchain::compilerCommand).path();
+    const QString path2 = bundle2.get(&Toolchain::compilerCommand).path();
+
+    const bool b1IsIcecc = path1.contains("icecc");
+    const bool b2IsIcecc = path2.contains("icecc");
+    if (b1IsIcecc)
+        return !b2IsIcecc;
+    if (b2IsIcecc)
+        return false;
+
+    const bool b1IsCCache = path1.contains("ccache");
+    const bool b2IsCcache = path2.contains("ccache");
+    if (b1IsCCache)
+        return !b2IsCcache;
+    if (b2IsCcache)
+        return false;
+
+    // Hack to prefer a tool chain from PATH (e.g. autodetected) over other matches.
+    // This improves the situation a bit if a cross-compilation tool chain has the
+    // same ABI as the host.
+    if (!bundle1.get(&Toolchain::compilerCommand).needsDevice()) {
+        const FilePaths envPathVar = Environment::systemEnvironment().path();
+        const auto toolchainIsInPath = [&envPathVar](const ToolchainBundle &b) {
+            return Utils::contains(b.toolchains(), [&envPathVar](const Toolchain *tc) {
+                return envPathVar.contains(tc->compilerCommand().parentDir());
+            });
+        };
+        const bool tc1IsInPath = toolchainIsInPath(bundle1);
+        const bool tc2IsInPath = toolchainIsInPath(bundle2);
+        if (tc1IsInPath) {
+            if (!tc2IsInPath)
+                return true;
+        } else if (tc2IsInPath) {
+            return false;
+        }
+    }
+
+    return path1.size() < path2.size();
 }
 
 } // namespace ProjectExplorer

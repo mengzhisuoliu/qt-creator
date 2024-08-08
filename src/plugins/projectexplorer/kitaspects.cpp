@@ -30,9 +30,12 @@
 #include <QComboBox>
 #include <QFontMetrics>
 #include <QGridLayout>
+#include <QHash>
 #include <QLabel>
 #include <QPushButton>
 #include <QVBoxLayout>
+
+#include <utility>
 
 using namespace Utils;
 
@@ -268,8 +271,10 @@ private:
                 return !tc->compilerCommand().isSameDevice(device->rootPath());
             });
 
-            const QList<ToolchainBundle> sameBundles = ToolchainBundle::collectBundles(same);
-            const QList<ToolchainBundle> otherBundles = ToolchainBundle::collectBundles(other);
+            const QList<ToolchainBundle> sameBundles
+                = ToolchainBundle::collectBundles(same, ToolchainBundle::AutoRegister::On);
+            const QList<ToolchainBundle> otherBundles
+                = ToolchainBundle::collectBundles(other, ToolchainBundle::AutoRegister::On);
             for (const ToolchainBundle &b : sameBundles)
                 cb->addItem(b.displayName(), b.bundleId().toSetting());
 
@@ -383,30 +388,6 @@ ToolchainKitAspectFactory::ToolchainKitAspectFactory()
     setPriority(30000);
 }
 
-// language id -> tool chain id
-static QMap<Id, QByteArray> defaultToolChainIds()
-{
-    QMap<Id, QByteArray> toolChains;
-    const Abi abi = Abi::hostAbi();
-    const Toolchains tcList = ToolchainManager::toolchains(equal(&Toolchain::targetAbi, abi));
-    const QList<Id> languages = ToolchainManager::allLanguages();
-    for (Id l : languages) {
-        Toolchain *tc = findOrDefault(tcList, equal(&Toolchain::language, l));
-        toolChains.insert(l, tc ? tc->id() : QByteArray());
-    }
-    return toolChains;
-}
-
-static Store defaultToolchainValue()
-{
-    const QMap<Id, QByteArray> toolChains = defaultToolChainIds();
-    Store result;
-    auto end = toolChains.end();
-    for (auto it = toolChains.begin(); it != end; ++it)
-        result.insert(it.key().toKey(), it.value());
-    return result;
-}
-
 Tasks ToolchainKitAspectFactory::validate(const Kit *k) const
 {
     Tasks result;
@@ -451,47 +432,113 @@ static Id findLanguage(const QString &ls)
                          [lsUpper](Id l) { return lsUpper == l.toString().toUpper(); });
 }
 
-void ToolchainKitAspectFactory::setup(Kit *k)
+using LanguageAndAbi = std::pair<Id, Abi>;
+using LanguagesAndAbis = QList<LanguageAndAbi>;
+
+static void setToolchainsFromAbis(Kit *k, const LanguagesAndAbis &abisByLanguage)
 {
-    QTC_ASSERT(ToolchainManager::isLoaded(), return);
-    QTC_ASSERT(k, return);
+    if (abisByLanguage.isEmpty())
+        return;
 
-    Store value = storeFromVariant(k->value(id()));
-    bool lockToolchains = k->isSdkProvided() && !value.isEmpty();
-    if (value.empty())
-        value = defaultToolchainValue();
+    // First transform languages into categories, so we can work on the bundle level.
+    // Obviously, we assume that the caller does not specify different ABIs for
+    // languages from the same category.
+    const QList<LanguageCategory> allCategories = ToolchainManager::languageCategories();
+    QHash<LanguageCategory, Abi> abisByCategory;
+    for (const LanguageAndAbi &langAndAbi : abisByLanguage) {
+        const auto category
+            = Utils::findOrDefault(allCategories, [&langAndAbi](const LanguageCategory &cat) {
+                  return cat.contains(langAndAbi.first);
+              });
+        QTC_ASSERT(!category.isEmpty(), continue);
+        abisByCategory.insert(category, langAndAbi.second);
+    }
 
+    // Get bundles.
+    const QList<ToolchainBundle> bundles = ToolchainBundle::collectBundles(
+        ToolchainBundle::AutoRegister::On);
+
+    // Set a matching bundle for each LanguageCategory/Abi pair, if possible.
+    for (auto it = abisByCategory.cbegin(); it != abisByCategory.cend(); ++it) {
+        const QList<ToolchainBundle> matchingBundles
+            = Utils::filtered(bundles, [&it](const ToolchainBundle &b) {
+                  return b.factory()->languageCategory() == it.key() && b.targetAbi() == it.value();
+              });
+
+        if (matchingBundles.isEmpty()) {
+            for (const Id language : it.key())
+                ToolchainKitAspect::clearToolchain(k, language);
+            continue;
+        }
+
+        const auto bestBundle
+            = std::min_element(bundles.begin(), bundles.end(), &ToolchainManager::isBetterToolchain);
+        ToolchainKitAspect::setBundle(k, *bestBundle);
+    }
+}
+
+static void setMissingToolchainsToHostAbi(Kit *k, const QList<Id> &languageBlacklist)
+{
+    LanguagesAndAbis abisByLanguage;
+    for (const Id lang : ToolchainManager::allLanguages()) {
+        if (languageBlacklist.contains(lang) || ToolchainKitAspect::toolchain(k, lang))
+            continue;
+        abisByLanguage.emplaceBack(lang, Abi::hostAbi());
+    }
+    setToolchainsFromAbis(k, abisByLanguage);
+}
+
+static void setupForSdkKit(Kit *k)
+{
+    const Store value = storeFromVariant(k->value(ToolchainKitAspect::id()));
+    bool lockToolchains = !value.isEmpty();
+
+    // The installer provides two kinds of entries for toolchains:
+    //   a) An actual toolchain id, for e.g. Boot2Qt where the installer ships the toolchains.
+    //   b) An ABI string, for Desktop Qt. In this case, it is our responsibility to find
+    //      a matching toolchain on the host system.
+    LanguagesAndAbis abisByLanguage;
     for (auto i = value.constBegin(); i != value.constEnd(); ++i) {
-        Id l = findLanguage(stringFromKey(i.key()));
+        const Id lang = findLanguage(stringFromKey(i.key()));
 
-        if (!l.isValid()) {
+        if (!lang.isValid()) {
             lockToolchains = false;
             continue;
         }
 
         const QByteArray id = i.value().toByteArray();
-        Toolchain *tc = ToolchainManager::findToolchain(id);
-        if (tc)
+        if (ToolchainManager::findToolchain(id))
             continue;
 
-        // ID is not found: Might be an ABI string...
+        // No toolchain with this id exists. Check whether it's an ABI string.
         lockToolchains = false;
-        const QString abi = QString::fromUtf8(id);
-        const Toolchains possibleTcs = ToolchainManager::toolchains([abi, l](const Toolchain *t) {
-            return t->targetAbi().toString() == abi && t->language() == l;
-        });
-        Toolchain *bestTc = nullptr;
-        for (Toolchain *tc : possibleTcs) {
-            if (!bestTc || tc->priority() > bestTc->priority())
-                bestTc = tc;
-        }
-        if (bestTc)
-            ToolchainKitAspect::setToolchain(k, bestTc);
-        else
-            ToolchainKitAspect::clearToolchain(k, l);
-    }
+        const Abi abi = Abi::fromString(QString::fromUtf8(id));
+        if (!abi.isValid())
+            continue;
 
-    k->setSticky(id(), lockToolchains);
+        abisByLanguage.emplaceBack(lang, abi);
+    }
+    setToolchainsFromAbis(k, abisByLanguage);
+    setMissingToolchainsToHostAbi(k, Utils::transform(abisByLanguage, &LanguageAndAbi::first));
+
+    k->setSticky(ToolchainKitAspect::id(), lockToolchains);
+}
+
+static void setupForNonSdkKit(Kit *k)
+{
+    setMissingToolchainsToHostAbi(k, {});
+    k->setSticky(ToolchainKitAspect::id(), false);
+}
+
+void ToolchainKitAspectFactory::setup(Kit *k)
+{
+    QTC_ASSERT(ToolchainManager::isLoaded(), return);
+    QTC_ASSERT(k, return);
+
+    if (k->isSdkProvided())
+        setupForSdkKit(k);
+    else
+        setupForNonSdkKit(k);
 }
 
 KitAspect *ToolchainKitAspectFactory::createKitAspect(Kit *k) const
@@ -625,55 +672,6 @@ void ToolchainKitAspect::setBundle(Kit *k, const ToolchainBundle &bundle)
     bundle.forEach<Toolchain>([k](Toolchain &tc) {
         setToolchain(k, &tc);
     });
-}
-
-/**
- * @brief ToolchainKitAspect::setAllToolchainsToMatch
- *
- * Set up all toolchains to be similar to the one toolchain provided. Similar ideally means
- * that all toolchains use the "same" compiler from the same installation, but we will
- * settle for a toolchain with a matching API instead.
- *
- * @param k The kit to set up
- * @param tc The toolchain to match other languages for.
- */
-void ToolchainKitAspect::setAllToolchainsToMatch(Kit *k, Toolchain *tc)
-{
-    QTC_ASSERT(tc, return);
-    QTC_ASSERT(k, return);
-
-    const Toolchains allTcList = ToolchainManager::toolchains();
-    QTC_ASSERT(allTcList.contains(tc), return);
-
-    Store result = storeFromVariant(k->value(ToolchainKitAspect::id()));
-    result.insert(tc->language().toKey(), tc->id());
-
-    for (const Id l : ToolchainManager::allLanguages()) {
-        if (l == tc->language())
-            continue;
-
-        Toolchain *match = nullptr;
-        Toolchain *bestMatch = nullptr;
-        for (Toolchain *other : allTcList) {
-            if (!other->isValid() || other->language() != l)
-                continue;
-            if (other->targetAbi() == tc->targetAbi())
-                match = other;
-            if (match == other
-                    && other->compilerCommand().parentDir() == tc->compilerCommand().parentDir()) {
-                bestMatch = other;
-                break;
-            }
-        }
-        if (bestMatch)
-            result.insert(l.toKey(), bestMatch->id());
-        else if (match)
-            result.insert(l.toKey(), match->id());
-        else
-            result.insert(l.toKey(), QByteArray());
-    }
-
-    k->setValue(id(), variantFromStore(result));
 }
 
 void ToolchainKitAspect::clearToolchain(Kit *k, Id language)

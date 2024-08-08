@@ -157,10 +157,8 @@ static bool kitMatchesAbiList(const Kit *kit, const Abis &abis)
     for (const Toolchain * const tc : toolchains) {
         const Abi tcAbi = tc->targetAbi();
         for (const Abi &abi : abis) {
-            if (tcAbi.os() == abi.os() && tcAbi.architecture() == abi.architecture()
-                && (tcAbi.os() != Abi::LinuxOS || tcAbi.osFlavor() == abi.osFlavor())) {
+            if (tcAbi == abi)
                 return true;
-            }
         }
     }
     return false;
@@ -302,13 +300,9 @@ void KitManager::restoreKits()
         // No kits exist yet, so let's try to autoconfigure some from the toolchains we know.
         QHash<Abi, QHash<LanguageCategory, std::optional<ToolchainBundle>>> uniqueToolchains;
 
-        // On Linux systems, we usually detect a plethora of same-ish toolchains. The following
-        // algorithm gives precedence to icecc and ccache and otherwise simply chooses the one with
-        // the shortest path.
-        const QList<ToolchainBundle> bundles = ToolchainBundle::collectBundles();
+        const QList<ToolchainBundle> bundles = ToolchainBundle::collectBundles(
+            ToolchainBundle::AutoRegister::On);
         for (const ToolchainBundle &bundle : bundles) {
-            ToolchainManager::registerToolchains(bundle.createdToolchains());
-
             auto &bestBundle
                 = uniqueToolchains[bundle.targetAbi()][bundle.factory()->languageCategory()];
             if (!bestBundle) {
@@ -316,32 +310,7 @@ void KitManager::restoreKits()
                 continue;
             }
 
-            const int bestPriority = bestBundle->get(&Toolchain::priority);
-            const int currentPriority = bundle.get(&Toolchain::priority);
-            if (bestPriority > currentPriority)
-                continue;
-            if (bestPriority < currentPriority) {
-                bestBundle = bundle;
-                continue;
-            }
-
-            const QString bestFilePath = bestBundle->get(&Toolchain::compilerCommand).toString();
-            const QString currentFilePath = bundle.get(&Toolchain::compilerCommand).toString();
-            if (bestFilePath.contains("icecc"))
-                continue;
-            if (currentFilePath.contains("icecc")) {
-                bestBundle = bundle;
-                continue;
-            }
-
-            if (bestFilePath.contains("ccache"))
-                continue;
-            if (currentFilePath.contains("ccache")) {
-                bestBundle = bundle;
-                continue;
-            }
-
-            if (bestFilePath.length() > currentFilePath.length())
+            if (ToolchainManager::isBetterToolchain(bundle, *bestBundle))
                 bestBundle = bundle;
         }
 
